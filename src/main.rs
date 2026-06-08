@@ -100,9 +100,15 @@ fn handle_focused_container_moved(
     }
 
     if let Some(focused_window) = find_focused_window(root_container) {
-        let (width, height) = get_container_size(&focused_window)
-            .context("focused container did not have a width or height")?;
-        change_tiling_direction(web_socket, width, height)?;
+        // Only react to genuinely tiled, shown windows. A minimized/floating/
+        // fullscreen window (or one mid-transition) reports stale dimensions
+        // that don't represent the tile it occupies, which would set the wrong
+        // tiling direction.
+        if is_tiling_shown(focused_window) {
+            let (width, height) = get_container_size(&focused_window)
+                .context("focused container did not have a width or height")?;
+            change_tiling_direction(web_socket, width, height)?;
+        }
     }
 
     Ok(())
@@ -115,12 +121,36 @@ fn handle_focus_changed(
     let focused_container = event
         .get_path(["data", "focusedContainer"])
         .context("Expected focus changed event to contain a focused container field")?;
+
+    // Skip windows that aren't tiled and fully shown. Minimized windows in
+    // particular keep stale width/height from before they were minimized, so
+    // reading them here would set the wrong tiling direction and cause newly
+    // restored/opened windows to split the wrong way (e.g. side-by-side
+    // instead of stacked).
+    if !is_tiling_shown(focused_container) {
+        return Ok(());
+    }
+
     let (width, height) = get_container_size(focused_container)
         .context("focused container did not have a width or height")?;
 
     change_tiling_direction(socket, width, height)?;
 
     Ok(())
+}
+
+/// Returns true only for windows that are actively part of the tiling layout
+/// and fully shown. Their reported width/height reflect the tile they occupy,
+/// which is what the tiling-direction heuristic relies on.
+fn is_tiling_shown(container: &Value) -> bool {
+    let state_type = container
+        .get_path(["state", "type"])
+        .and_then(|v| v.as_str());
+    let display_state = container
+        .get_path(["displayState"])
+        .and_then(|v| v.as_str());
+
+    state_type == Some("tiling") && display_state == Some("shown")
 }
 
 fn get_container_size(event: &Value) -> Option<(f64, f64)> {
