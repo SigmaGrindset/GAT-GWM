@@ -27,18 +27,17 @@ async fn main() -> anyhow::Result<()> {
     )
     .context("Failed to connect to GWM WS")?;
 
+    // Subscribe to all events through a single subscription. GlazeWM
+    // delivers each subscription independently, so events from separate
+    // subscriptions can arrive out of order (e.g. a stale
+    // focused_container_moved after a newer focus_changed), which would
+    // leave the wrong tiling direction applied.
     socket
-        .send(Message::Text(r#"sub -e focus_changed"#.into()))
-        .context("Failed to subscribe to focus_changed event")?;
+        .send(Message::Text(
+            r#"sub -e focus_changed focused_container_moved application_exiting"#.into(),
+        ))
+        .context("Failed to subscribe to GlazeWM events")?;
 
-    socket
-        .send(Message::Text(r#"sub -e focused_container_moved"#.into()))
-        .context("Failed to subscribe to container moved")?;
-    
-    socket
-        .send(Message::Text(r#"sub -e application_exiting"#.into()))
-        .context("Failed to subscribe to container moved")?;
-    
     loop {
         let event = match read_as::<Value>(&mut socket) {
             Err(e) => {
