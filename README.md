@@ -4,8 +4,9 @@
 This is an auto tiler for the [GlazeWM](https://github.com/glzr-io/glazewm) window manager. It is written in Rust
 which allows for easy and portable compilation.
 
-Any time a window is focused, the tiling direction of the window will be set that a new window will be placed in the
-direction with the highest length. 
+Any time the layout changes (e.g. a window is focused, moved, opened or closed), the tiling direction of every tiled
+window will be set such that a new window will be placed in the direction with the highest length. This also decides
+how a window that is moved into a neighbouring window is placed, e.g. it will be stacked below a tall neighbour.
 
 ```
 Initial state:

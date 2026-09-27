@@ -11,6 +11,9 @@ use tungstenite::http::Uri;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{connect, Message, WebSocket};
 
+/// Message for querying the workspaces, including their container trees.
+const QUERY_WORKSPACES: &str = "query workspaces";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut tray: TrayItem = TrayItem::new(
@@ -29,17 +32,18 @@ async fn main() -> anyhow::Result<()> {
 
     // Subscribe to all events through a single subscription. GlazeWM
     // delivers each subscription independently, so events from separate
-    // subscriptions can arrive out of order (e.g. a stale
-    // focused_container_moved after a newer focus_changed), which would
-    // leave the wrong tiling direction applied.
+    // subscriptions can arrive out of order.
     socket
         .send(Message::Text(
-            r#"sub -e focus_changed focused_container_moved application_exiting"#.into(),
+            r#"sub -e focus_changed focused_container_moved window_managed window_unmanaged application_exiting"#.into(),
         ))
         .context("Failed to subscribe to GlazeWM events")?;
 
+    // Set the tiling directions of the windows that are already open.
+    query_workspaces(&mut socket)?;
+
     loop {
-        let event = match read_as::<Value>(&mut socket) {
+        let message = match read_as::<Value>(&mut socket) {
             Err(e) => {
                 return Err(e);
             }
@@ -47,109 +51,121 @@ async fn main() -> anyhow::Result<()> {
             Ok(None) => continue,
         };
 
-        let event_type = event.get_path(["data", "eventType"]);
-        
-        match event_type.and_then(|v| v.as_str()) {
-            Some("focused_container_moved") => {
-                _ = handle_focused_container_moved(event, &mut socket).inspect_err(|e| {
-                    eprintln!("Failed to handle focused container moved event: {e}")
-                });
+        match message.get_path(["messageType"]).and_then(|v| v.as_str()) {
+            Some("event_subscription") => {
+                let event_type = message.get_path(["data", "eventType"]);
+
+                if event_type.and_then(|v| v.as_str()) == Some("application_exiting") {
+                    eprintln!("GlazeWM is exiting, exiting too.");
+                    std::process::exit(0);
+                }
+
+                // The other subscribed events can all change the size of
+                // windows, so re-query the layout to update the tiling
+                // directions from. The query is answered with the state at
+                // the time it's handled, so it can't be outdated by events
+                // that arrive out of order.
+                _ = query_workspaces(&mut socket)
+                    .inspect_err(|e| eprintln!("Failed to query workspaces: {e}"));
             }
-            Some("focus_changed") => {
-                _ = handle_focus_changed(event, &mut socket)
-                    .inspect_err(|e| eprintln!("Failed to handle focus changed event: {e}"))
-            }
-            Some("application_exiting") => {
-                eprintln!("GlazeWM is exiting, exiting too.");
-                std::process::exit(0);
+            Some("client_response") => {
+                let client_message = message.get_path(["clientMessage"]);
+
+                if client_message.and_then(|v| v.as_str()) == Some(QUERY_WORKSPACES) {
+                    _ = handle_workspaces_response(message, &mut socket).inspect_err(|e| {
+                        eprintln!("Failed to handle workspaces response: {e}")
+                    });
+                }
             }
             _ => continue,
         }
     }
 }
 
-fn handle_focused_container_moved(
-    event: Value,
-    web_socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
-) -> anyhow::Result<()> {
-    let root_container = event
-        .get_path(["data", "focusedContainer"])
-        .context("Expected focused container event to contain a focused container field")?;
-
-    fn find_focused_window(container: &Value) -> Option<&Value> {
-        let container_type = container.get_path(["type"]).and_then(|v| v.as_str())?;
-        let has_focus = container.get_path(["hasFocus"]).and_then(|v| v.as_bool())?;
-
-        // Termination case: focused window found
-        if container_type == "window" && has_focus {
-            return Some(container);
-        }
-
-        let children = container.get("children").and_then(|v| v.as_array())?;
-
-        // Recursive case: search through children
-        for child in children {
-            if let Some(focused_container) = find_focused_window(child) {
-                return Some(focused_container);
-            }
-        }
-
-        // Termination case: No window with focus
-        None
-    }
-
-    if let Some(focused_window) = find_focused_window(root_container) {
-        // Only react to genuinely tiled, shown windows. A minimized/floating/
-        // fullscreen window (or one mid-transition) reports stale dimensions
-        // that don't represent the tile it occupies, which would set the wrong
-        // tiling direction.
-        if is_tiling_shown(focused_window) {
-            let (width, height) = get_container_size(&focused_window)
-                .context("focused container did not have a width or height")?;
-            change_tiling_direction(web_socket, width, height)?;
-        }
-    }
-
-    Ok(())
+fn query_workspaces(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> anyhow::Result<()> {
+    socket
+        .send(Message::Text(QUERY_WORKSPACES.into()))
+        .context("Failed to send message to GWM")
 }
 
-fn handle_focus_changed(
-    event: Value,
+/// Sets the tiling direction of every tiling window in the workspaces from
+/// a workspaces query response.
+///
+/// All windows are updated rather than only the focused one, since the
+/// tiling direction of a window also decides what happens when another
+/// window is moved into it. E.g. a window that is moved into a tall
+/// neighbour is only stacked with it if the neighbour is set to vertical,
+/// otherwise the two are swapped.
+fn handle_workspaces_response(
+    response: Value,
     socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
 ) -> anyhow::Result<()> {
-    let focused_container = event
-        .get_path(["data", "focusedContainer"])
-        .context("Expected focus changed event to contain a focused container field")?;
+    let workspaces = response
+        .get_path(["data", "workspaces"])
+        .and_then(|v| v.as_array())
+        .context("Expected workspaces response to contain a workspaces field")?;
 
-    // Skip windows that aren't tiled and fully shown. Minimized windows in
-    // particular keep stale width/height from before they were minimized, so
-    // reading them here would set the wrong tiling direction and cause newly
-    // restored/opened windows to split the wrong way (e.g. side-by-side
-    // instead of stacked).
-    if !is_tiling_shown(focused_container) {
-        return Ok(());
+    let mut updates = Vec::new();
+
+    for workspace in workspaces {
+        collect_tiling_direction_updates(workspace, &mut updates)?;
     }
 
-    let (width, height) = get_container_size(focused_container)
-        .context("focused container did not have a width or height")?;
-
-    change_tiling_direction(socket, width, height)?;
+    for (window_id, tiling_direction) in updates {
+        set_tiling_direction(socket, window_id, tiling_direction)?;
+    }
 
     Ok(())
 }
 
-/// Returns true only for windows that are actively part of the tiling layout
-/// and fully shown. Their reported width/height reflect the tile they occupy,
-/// which is what the tiling-direction heuristic relies on.
-fn is_tiling_shown(container: &Value) -> bool {
-    let state_type = container
-        .get_path(["state", "type"])
-        .and_then(|v| v.as_str());
-    let display_state = container
-        .get_path(["displayState"])
-        .and_then(|v| v.as_str());
+/// Recursively collects the tiling windows within the given workspace or
+/// split container whose tiling direction doesn't match their size.
+///
+/// Each update is a tuple of the window ID and its new tiling direction.
+fn collect_tiling_direction_updates<'a>(
+    container: &'a Value,
+    updates: &mut Vec<(&'a str, &'static str)>,
+) -> anyhow::Result<()> {
+    // The tiling direction of a tiling window is the tiling direction of its
+    // parent workspace or split container.
+    let tiling_direction = container.get("tilingDirection").and_then(|v| v.as_str());
 
-    state_type == Some("tiling") && display_state == Some("shown")
+    let children = container
+        .get("children")
+        .and_then(|v| v.as_array())
+        .context("Expected container to contain a children field")?;
+
+    for child in children {
+        match child.get("type").and_then(|v| v.as_str()) {
+            Some("split") => collect_tiling_direction_updates(child, updates)?,
+            // Floating, fullscreen, and minimized windows aren't part of the
+            // tiling layout, so they're skipped.
+            Some("window") if is_tiling(child) => {
+                let (width, height) = get_container_size(child)
+                    .context("window did not have a width or height")?;
+
+                let Some(target_direction) = tiling_direction_for_size(width, height) else {
+                    continue;
+                };
+
+                if tiling_direction != Some(target_direction) {
+                    let window_id = child
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .context("window did not have an id")?;
+
+                    updates.push((window_id, target_direction));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn is_tiling(window: &Value) -> bool {
+    window.get_path(["state", "type"]).and_then(|v| v.as_str()) == Some("tiling")
 }
 
 fn get_container_size(event: &Value) -> Option<(f64, f64)> {
@@ -159,27 +175,29 @@ fn get_container_size(event: &Value) -> Option<(f64, f64)> {
     Some((width, height))
 }
 
-fn change_tiling_direction(
-    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
-    window_width: f64,
-    window_height: f64,
-) -> anyhow::Result<()> {
+/// Gets the tiling direction that splits a window along its longest side.
+///
+/// Returns `None` for square windows.
+fn tiling_direction_for_size(window_width: f64, window_height: f64) -> Option<&'static str> {
     if window_width < window_height {
-        socket
-            .send(Message::Text(
-                "command set-tiling-direction vertical".into(),
-            ))
-            .context("Failed to send message to GWM")?;
+        Some("vertical")
+    } else if window_width > window_height {
+        Some("horizontal")
+    } else {
+        None
     }
-    if window_width > window_height {
-        socket
-            .send(Message::Text(
-                "command set-tiling-direction horizontal".into(),
-            ))
-            .context("Failed to send message to GWM")?;
-    };
+}
 
-    Ok(())
+fn set_tiling_direction(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    window_id: &str,
+    tiling_direction: &str,
+) -> anyhow::Result<()> {
+    socket
+        .send(Message::Text(
+            format!("command --id {window_id} set-tiling-direction {tiling_direction}").into(),
+        ))
+        .context("Failed to send message to GWM")
 }
 
 fn read_as<T: DeserializeOwned>(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) -> anyhow::Result<Option<T>> {
@@ -224,5 +242,99 @@ impl JsonValueExt for Value {
     fn get_path<T: IntoIterator<Item = I>, I: Index>(&self, path: T) -> Option<&Value> {
         path.into_iter()
             .fold(Some(self), |acc, key| acc.and_then(|v| v.get(key)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{json, Value};
+
+    use super::collect_tiling_direction_updates;
+
+    fn window(id: &str, width: u32, height: u32, state: &str) -> Value {
+        json!({
+            "type": "window",
+            "id": id,
+            "width": width,
+            "height": height,
+            "state": { "type": state },
+        })
+    }
+
+    fn container(kind: &str, tiling_direction: &str, children: Vec<Value>) -> Value {
+        json!({
+            "type": kind,
+            "tilingDirection": tiling_direction,
+            "children": children,
+        })
+    }
+
+    fn updates(workspace: &Value) -> anyhow::Result<Vec<(&str, &'static str)>> {
+        let mut updates = Vec::new();
+        collect_tiling_direction_updates(workspace, &mut updates)?;
+        Ok(updates)
+    }
+
+    #[test]
+    fn updates_windows_that_are_not_focused() -> anyhow::Result<()> {
+        // Layout of H[a V[b c]], where `a` was never focused while tall.
+        // Moving `c` left twice should stack it with `a`, which requires
+        // `a` to be set to vertical.
+        let workspace = container(
+            "workspace",
+            "horizontal",
+            vec![
+                window("a", 960, 1080, "tiling"),
+                container(
+                    "split",
+                    "vertical",
+                    vec![
+                        window("b", 960, 540, "tiling"),
+                        window("c", 960, 540, "tiling"),
+                    ],
+                ),
+            ],
+        );
+
+        assert_eq!(
+            updates(&workspace)?,
+            vec![("a", "vertical"), ("b", "horizontal"), ("c", "horizontal")]
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn skips_windows_with_matching_direction() -> anyhow::Result<()> {
+        // Layout of H[V[a] V[b]], where both windows are already vertical.
+        let workspace = container(
+            "workspace",
+            "horizontal",
+            vec![
+                container("split", "vertical", vec![window("a", 960, 1080, "tiling")]),
+                container("split", "vertical", vec![window("b", 960, 1080, "tiling")]),
+            ],
+        );
+
+        assert!(updates(&workspace)?.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn skips_non_tiling_and_square_windows() -> anyhow::Result<()> {
+        let workspace = container(
+            "workspace",
+            "vertical",
+            vec![
+                window("minimized", 1920, 1080, "minimized"),
+                window("floating", 1920, 1080, "floating"),
+                window("square", 1080, 1080, "tiling"),
+            ],
+        );
+
+        assert!(updates(&workspace)?.is_empty());
+
+        Ok(())
     }
 }
